@@ -1,14 +1,15 @@
 import pandas as pd
 import numpy as np
 import polars as pl
-#import pyarrow as pa
 import time
 import matplotlib.pyplot as plt
 import seaborn as sns
-from memory_profiler import memory_usage
+import psutil
+import os
 
 
 def generate_large_dataset(n_rows=1000000):
+    """Генерация большого датасета"""
     return pd.DataFrame({
         'id': range(n_rows),
         'timestamp': pd.date_range('2020-01-01', periods=n_rows, freq='1min'),
@@ -17,6 +18,36 @@ def generate_large_dataset(n_rows=1000000):
         'value2': np.random.exponential(1, n_rows),
         'value3': np.random.randint(0, 100, n_rows)
     })
+
+
+def get_memory_usage():
+    """Получить текущее использование памяти в MB"""
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / 1024 / 1024
+
+
+def benchmark_operation(operation_func, *args, **kwargs):
+    """Бенчмарк операции с измерением времени и пиковой памяти"""
+    start_time = time.time()
+
+    # Замеряем пиковую память
+    peak_memory = get_memory_usage()
+
+    try:
+        operation_func(*args, **kwargs)  # Просто вызываем, без сохранения результата
+    except Exception as e:
+        end_time = time.time()
+        execution_time = end_time - start_time
+        return execution_time, float('inf'), e
+
+    end_time = time.time()
+    execution_time = end_time - start_time
+
+    # Проверяем пиковую память после выполнения
+    current_memory = get_memory_usage()
+    peak_memory = max(peak_memory, current_memory)
+
+    return execution_time, peak_memory, None
 
 
 # Операция 1: Фильтрация и агрегация
@@ -139,32 +170,37 @@ def polars_join(df1, df2, df3):
     return result
 
 
-# Операция 4: Скользящее среднее
+# Операция 4: Скользящее среднее (исправленная версия)
 def pandas_rolling(df):
-    result = df.set_index('timestamp').sort_index()
+    # Берем подмножество для демонстрации, чтобы не перегружать память
+    sample_df = df.iloc[:50000].copy()
+    result = sample_df.set_index('timestamp').sort_index()
     result['value1_rolling'] = result['value1'].rolling('10min').mean()
     result['value2_rolling'] = result['value2'].rolling('10min').mean()
     return result[['value1_rolling', 'value2_rolling']].reset_index()
 
 
 def pandas_pyarrow_rolling(df):
-    df_pa = df.astype({
+    sample_df = df.iloc[:50000].copy()
+    sample_df = sample_df.astype({
         'value1': 'float64[pyarrow]',
         'value2': 'float64[pyarrow]'
     })
-    result = df_pa.set_index('timestamp').sort_index()
+    result = sample_df.set_index('timestamp').sort_index()
     result['value1_rolling'] = result['value1'].rolling('10min').mean()
     result['value2_rolling'] = result['value2'].rolling('10min').mean()
     return result[['value1_rolling', 'value2_rolling']].reset_index()
 
 
 def polars_rolling(df):
-    pl_df = pl.from_pandas(df)
+    # В Polars используем временное окно
+    sample_df = df.iloc[:50000].copy()
+    pl_df = pl.from_pandas(sample_df)
     result = (pl_df
               .sort('timestamp')
               .with_columns([
-        pl.col('value1').rolling_mean(window_size=10).alias('value1_rolling'),
-        pl.col('value2').rolling_mean(window_size=10).alias('value2_rolling')
+        pl.col('value1').rolling_mean_by('timestamp', window='10min').alias('value1_rolling'),
+        pl.col('value2').rolling_mean_by('timestamp', window='10min').alias('value2_rolling')
     ])
               .select(['timestamp', 'value1_rolling', 'value2_rolling']))
     return result
@@ -217,28 +253,8 @@ def polars_resample(df):
     return result
 
 
-# Бенчмаркинг
-def benchmark_operation(operation_func, *args):
-    start_time = time.time()
-
-    # Для измерения памяти используем более простой подход
-    import psutil
-    import os
-    process = psutil.Process(os.getpid())
-    memory_before = process.memory_info().rss / 1024 / 1024  # в MB
-
-    result = operation_func(*args)
-
-    memory_after = process.memory_info().rss / 1024 / 1024  # в MB
-    end_time = time.time()
-
-    execution_time = end_time - start_time
-    peak_memory = max(memory_before, memory_after)
-
-    return execution_time, peak_memory
-
-
 def run_benchmarks(df):
+    """Запуск всех бенчмарков"""
     operations = {
         'Фильтрация и агрегация': {
             'pandas': (pandas_filter_aggregate, [df]),
@@ -272,24 +288,26 @@ def run_benchmarks(df):
         results[op_name] = {}
         for impl_name, (func, args) in implementations.items():
             print(f"Выполняется {op_name} - {impl_name}...")
-            try:
-                time_taken, memory_used = benchmark_operation(func, *args)
+            time_taken, memory_used, error = benchmark_operation(func, *args)
+
+            if error:
+                print(f"  Ошибка: {error}")
+                results[op_name][impl_name] = {
+                    'time': float('inf'),
+                    'memory': float('inf')
+                }
+            else:
                 results[op_name][impl_name] = {
                     'time': time_taken,
                     'memory': memory_used
                 }
                 print(f"  Время: {time_taken:.3f}с, Память: {memory_used:.1f}MB")
-            except Exception as e:
-                print(f"  Ошибка: {e}")
-                results[op_name][impl_name] = {
-                    'time': float('inf'),
-                    'memory': float('inf')
-                }
 
     return results
 
 
 def generate_comparison_report(results):
+    """Генерация отчета сравнения"""
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
 
     # Подготовка данных для heatmap
@@ -303,12 +321,17 @@ def generate_comparison_report(results):
 
     # Heatmap относительной производительности
     relative_performance = performance_data.div(performance_data.min(axis=1), axis=0)
-    # Заменяем бесконечные значения на максимальные + 1
-    max_val = relative_performance[relative_performance < float('inf')].max().max()
-    relative_performance = relative_performance.replace(float('inf'), max_val + 1)
 
-    sns.heatmap(relative_performance, annot=True, fmt='.2f', cmap='RdYlGn',
-                center=1, ax=axes[0, 0], cbar_kws={'label': 'Относительное время выполнения'})
+    # Обрабатываем случаи с ошибками (inf)
+    for col in relative_performance.columns:
+        # Находим максимальное значение в столбце (без inf)
+        max_val = relative_performance[relative_performance[col] < float('inf')][col].max()
+        if pd.isna(max_val):
+            max_val = 5  # Значение по умолчанию если все значения inf
+        relative_performance[col] = relative_performance[col].replace(float('inf'), max_val * 2)
+
+    sns.heatmap(relative_performance, annot=True, fmt='.2f', cmap='RdYlGn_r',
+                center=2, ax=axes[0, 0], cbar_kws={'label': 'Относительное время выполнения'})
     axes[0, 0].set_title('Относительная производительность\n(1.0 = наилучший результат)', fontsize=12, pad=20)
     axes[0, 0].set_xlabel('Библиотека')
     axes[0, 0].set_ylabel('Операция')
@@ -322,6 +345,10 @@ def generate_comparison_report(results):
         for op_name in results
     }).T
 
+    # Заменяем inf на максимальное значение + 10%
+    max_memory = memory_data[memory_data < float('inf')].max().max()
+    memory_data = memory_data.replace(float('inf'), max_memory * 1.1)
+
     memory_data.plot(kind='bar', ax=axes[0, 1])
     axes[0, 1].set_title('Пиковое использование памяти', fontsize=12, pad=20)
     axes[0, 1].set_xlabel('Операция')
@@ -330,8 +357,13 @@ def generate_comparison_report(results):
     axes[0, 1].tick_params(axis='x', rotation=45)
 
     # График времени выполнения
-    performance_data_clean = performance_data.replace(float('inf'),
-                                                      performance_data[performance_data < float('inf')].max().max())
+    performance_data_clean = performance_data.copy()
+    for col in performance_data_clean.columns:
+        max_val = performance_data_clean[performance_data_clean[col] < float('inf')][col].max()
+        if pd.isna(max_val):
+            max_val = 5
+        performance_data_clean[col] = performance_data_clean[col].replace(float('inf'), max_val * 1.2)
+
     performance_data_clean.plot(kind='bar', ax=axes[1, 0])
     axes[1, 0].set_title('Время выполнения операций', fontsize=12, pad=20)
     axes[1, 0].set_xlabel('Операция')
@@ -369,8 +401,9 @@ def generate_comparison_report(results):
 
 
 def main():
+    """Основная функция"""
     print("Генерация датасета...")
-    df = generate_large_dataset(100000)
+    df = generate_large_dataset(1000000)  # Теперь 1,000,000 строк
 
     print("Проверка данных:")
     print(f"Размер датасета: {df.shape}")
@@ -381,17 +414,33 @@ def main():
     results = run_benchmarks(df)
 
     print("\nГенерация отчета...")
-    fig = generate_comparison_report(results)
+    generate_comparison_report(results)
     plt.savefig('benchmark_comparison.png', dpi=300, bbox_inches='tight')
     plt.show()
 
     # Анализ удобства API
     print("\n=== Анализ удобства API ===")
-    print("Pandas: Зрелый API, отличная документация, привычный синтаксис")
-    print("Pandas + PyArrow: Те же преимущества pandas с улучшенной обработкой типов")
-    print("Polars: Современный API, ленивые вычисления, высокая производительность")
+    print("\n1. Pandas:")
+    print("   + Зрелый API с отличной документацией")
+    print("   + Привычный синтаксис для большинства пользователей")
+    print("   + Широкий набор функций")
+    print("   - Может быть медленным на больших данных")
+    print("   - Использует больше памяти")
+
+    print("\n2. Pandas + PyArrow:")
+    print("   + Все преимущества pandas")
+    print("   + Улучшенная обработка строковых данных")
+    print("   + Более эффективное использование памяти для строк")
+    print("   - Не все операции оптимизированы под PyArrow")
+
+    print("\n3. Polars:")
+    print("   + Высокая производительность на больших данных")
+    print("   + Ленивые вычисления и оптимизация запросов")
+    print("   + Эффективное использование памяти")
+    print("   + Современный API с цепочечным синтаксисом")
+    print("   - Крутая кривая обучения для пользователей pandas")
+    print("   - Меньше готовых функций по сравнению с pandas")
 
 
 if __name__ == "__main__":
-
     main()
