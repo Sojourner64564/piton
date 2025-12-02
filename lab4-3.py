@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import polars as pl
-import pyarrow as pa
+#import pyarrow as pa
 import time
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -393,4 +393,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
